@@ -560,16 +560,17 @@ fn capture_loop(
     channels: usize,
 ) -> Result<ThreadRunState> {
     let handles = [stop_event, capture_event];
+    let mut last_endpoint_check =
+        Instant::now() - Duration::from_millis(u64::from(DEVICE_REBIND_POLL_MS));
     loop {
+        if should_rebind_default_render_endpoint(endpoint_id, &mut last_endpoint_check)? {
+            return Ok(ThreadRunState::Restart);
+        }
+
         match wait_for_multiple_objects_timeout(&handles, DEVICE_REBIND_POLL_MS)? {
             Some(0) => return Ok(ThreadRunState::Stop),
             Some(1) => {}
-            None => {
-                if has_default_render_endpoint_changed(endpoint_id)? {
-                    return Ok(ThreadRunState::Restart);
-                }
-                continue;
-            }
+            None => continue,
             index => {
                 return Err(Error::Backend(format!(
                     "unexpected wait result from loopback capture thread: {index:?}"
@@ -671,16 +672,17 @@ fn playback_loop(
     buffer_frames: u32,
 ) -> Result<ThreadRunState> {
     let handles = [stop_event, render_event];
+    let mut last_endpoint_check =
+        Instant::now() - Duration::from_millis(u64::from(DEVICE_REBIND_POLL_MS));
     loop {
+        if should_rebind_default_render_endpoint(endpoint_id, &mut last_endpoint_check)? {
+            return Ok(ThreadRunState::Restart);
+        }
+
         match wait_for_multiple_objects_timeout(&handles, DEVICE_REBIND_POLL_MS)? {
             Some(0) => return Ok(ThreadRunState::Stop),
             Some(1) => {}
-            None => {
-                if has_default_render_endpoint_changed(endpoint_id)? {
-                    return Ok(ThreadRunState::Restart);
-                }
-                continue;
-            }
+            None => continue,
             index => {
                 return Err(Error::Backend(format!(
                     "unexpected wait result from render thread: {index:?}"
@@ -1050,6 +1052,19 @@ fn has_default_render_endpoint_changed(bound_endpoint_id: &str) -> Result<bool> 
         Ok(current) => Ok(current != bound_endpoint_id),
         Err(_) => Ok(true),
     }
+}
+
+fn should_rebind_default_render_endpoint(
+    bound_endpoint_id: &str,
+    last_check: &mut Instant,
+) -> Result<bool> {
+    let now = Instant::now();
+    if now.duration_since(*last_check) < Duration::from_millis(u64::from(DEVICE_REBIND_POLL_MS)) {
+        return Ok(false);
+    }
+
+    *last_check = now;
+    has_default_render_endpoint_changed(bound_endpoint_id)
 }
 
 fn should_restart_audio_client(hr: i32) -> bool {
