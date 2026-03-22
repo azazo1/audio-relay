@@ -20,8 +20,10 @@ const CLSCTX_ALL: u32 = 23;
 const COINIT_MULTITHREADED: u32 = 0;
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_FAILED: u32 = 0xFFFF_FFFF;
-const INFINITE: u32 = 0xFFFF_FFFF;
+const WAIT_TIMEOUT: u32 = 258;
 const FALSE: i32 = 0;
+const DEVICE_REBIND_POLL_MS: u32 = 500;
+const DEVICE_RETRY_BACKOFF_MS: u32 = 500;
 
 const AUDCLNT_SHAREMODE_SHARED: u32 = 0;
 const AUDCLNT_STREAMFLAGS_LOOPBACK: u32 = 0x0002_0000;
@@ -30,6 +32,10 @@ const AUDCLNT_STREAMFLAGS_NOPERSIST: u32 = 0x0008_0000;
 const AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY: u32 = 0x0800_0000;
 const AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM: u32 = 0x8000_0000;
 const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
+const AUDCLNT_E_DEVICE_INVALIDATED: i32 = 0x8889_0004u32 as i32;
+const AUDCLNT_E_ENDPOINT_CREATE_FAILED: i32 = 0x8889_000Fu32 as i32;
+const AUDCLNT_E_SERVICE_NOT_RUNNING: i32 = 0x8889_0010u32 as i32;
+const AUDCLNT_E_RESOURCES_INVALIDATED: i32 = 0x8889_0026u32 as i32;
 
 const E_RENDER: u32 = 0;
 const E_CONSOLE: u32 = 0;
@@ -195,6 +201,12 @@ impl WasapiSpec {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThreadRunState {
+    Stop,
+    Restart,
+}
+
 fn spawn_capture_thread(
     stop_event: Handle,
     ring: Arc<SharedSampleRing>,
@@ -204,19 +216,7 @@ fn spawn_capture_thread(
     let thread = thread::Builder::new()
         .name("audio-relay-win-capture".into())
         .spawn(move || {
-            match CaptureThreadContext::start(spec) {
-                Ok(context) => {
-                    let _ = ready_tx.send(Ok(()));
-                    if let Err(err) = context.run(stop_event, &ring) {
-                        ring.close(Some(err.to_string()));
-                    }
-                }
-                Err(err) => {
-                    let message = err.to_string();
-                    let _ = ready_tx.send(Err(message.clone()));
-                    ring.close(Some(message));
-                }
-            }
+            capture_thread_main(stop_event, ring, spec, ready_tx);
         })
         .map_err(|err| Error::Backend(format!("failed to spawn Windows capture thread: {err}")))?;
 
@@ -244,19 +244,7 @@ fn spawn_playback_thread(
     let thread = thread::Builder::new()
         .name("audio-relay-win-playback".into())
         .spawn(move || {
-            match PlaybackThreadContext::start(spec) {
-                Ok(context) => {
-                    let _ = ready_tx.send(Ok(()));
-                    if let Err(err) = context.run(stop_event, &ring) {
-                        ring.close(Some(err.to_string()));
-                    }
-                }
-                Err(err) => {
-                    let message = err.to_string();
-                    let _ = ready_tx.send(Err(message.clone()));
-                    ring.close(Some(message));
-                }
-            }
+            playback_thread_main(stop_event, ring, spec, ready_tx);
         })
         .map_err(|err| Error::Backend(format!("failed to spawn Windows playback thread: {err}")))?;
 
@@ -275,18 +263,122 @@ fn spawn_playback_thread(
     }
 }
 
+fn capture_thread_main(
+    stop_event: Handle,
+    ring: Arc<SharedSampleRing>,
+    spec: WasapiSpec,
+    ready_tx: mpsc::Sender<std::result::Result<(), String>>,
+) {
+    let mut ready_sent = false;
+    loop {
+        match CaptureThreadContext::start(spec) {
+            Ok(context) => {
+                if !ready_sent {
+                    let _ = ready_tx.send(Ok(()));
+                    ready_sent = true;
+                }
+
+                match context.run(stop_event, &ring) {
+                    Ok(ThreadRunState::Stop) => return,
+                    Ok(ThreadRunState::Restart) => continue,
+                    Err(err) => {
+                        if !ready_sent {
+                            let message = err.to_string();
+                            let _ = ready_tx.send(Err(message.clone()));
+                            ring.close(Some(message));
+                            return;
+                        }
+                        ring.close(Some(err.to_string()));
+                        return;
+                    }
+                }
+            }
+            Err(err) => {
+                if !ready_sent {
+                    let message = err.to_string();
+                    let _ = ready_tx.send(Err(message.clone()));
+                    ring.close(Some(message));
+                    return;
+                }
+
+                match wait_for_stop_or_timeout(stop_event, DEVICE_RETRY_BACKOFF_MS) {
+                    Ok(true) => return,
+                    Ok(false) => continue,
+                    Err(wait_err) => {
+                        ring.close(Some(wait_err.to_string()));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn playback_thread_main(
+    stop_event: Handle,
+    ring: Arc<SharedSampleRing>,
+    spec: WasapiSpec,
+    ready_tx: mpsc::Sender<std::result::Result<(), String>>,
+) {
+    let mut ready_sent = false;
+    loop {
+        match PlaybackThreadContext::start(spec) {
+            Ok(context) => {
+                if !ready_sent {
+                    let _ = ready_tx.send(Ok(()));
+                    ready_sent = true;
+                }
+
+                match context.run(stop_event, &ring) {
+                    Ok(ThreadRunState::Stop) => return,
+                    Ok(ThreadRunState::Restart) => continue,
+                    Err(err) => {
+                        if !ready_sent {
+                            let message = err.to_string();
+                            let _ = ready_tx.send(Err(message.clone()));
+                            ring.close(Some(message));
+                            return;
+                        }
+                        ring.close(Some(err.to_string()));
+                        return;
+                    }
+                }
+            }
+            Err(err) => {
+                if !ready_sent {
+                    let message = err.to_string();
+                    let _ = ready_tx.send(Err(message.clone()));
+                    ring.close(Some(message));
+                    return;
+                }
+
+                match wait_for_stop_or_timeout(stop_event, DEVICE_RETRY_BACKOFF_MS) {
+                    Ok(true) => return,
+                    Ok(false) => continue,
+                    Err(wait_err) => {
+                        ring.close(Some(wait_err.to_string()));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct CaptureThreadContext {
     _com: ComApartment,
     audio_client: ComPtr<IAudioClient>,
     capture_client: ComPtr<IAudioCaptureClient>,
     capture_event: OwnedHandle,
+    endpoint_id: String,
     channels: usize,
 }
 
 impl CaptureThreadContext {
     fn start(spec: WasapiSpec) -> Result<Self> {
         let com = ComApartment::new()?;
-        let audio_client = activate_default_audio_client()?;
+        let activated = activate_default_audio_client()?;
+        let audio_client = activated.audio_client;
         let capture_event = OwnedHandle::create_manual_reset(false)?;
         let format = spec.wave_format();
         let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK
@@ -335,16 +427,18 @@ impl CaptureThreadContext {
             audio_client,
             capture_client,
             capture_event,
+            endpoint_id: activated.endpoint_id,
             channels: spec.channels as usize,
         })
     }
 
-    fn run(self, stop_event: Handle, ring: &SharedSampleRing) -> Result<()> {
+    fn run(self, stop_event: Handle, ring: &SharedSampleRing) -> Result<ThreadRunState> {
         let result = capture_loop(
             self.capture_client.as_ptr(),
             self.capture_event.raw(),
             stop_event,
             ring,
+            &self.endpoint_id,
             self.channels,
         );
 
@@ -361,6 +455,7 @@ struct PlaybackThreadContext {
     audio_client: ComPtr<IAudioClient>,
     render_client: ComPtr<IAudioRenderClient>,
     render_event: OwnedHandle,
+    endpoint_id: String,
     channels: usize,
     buffer_frames: u32,
 }
@@ -368,7 +463,8 @@ struct PlaybackThreadContext {
 impl PlaybackThreadContext {
     fn start(spec: WasapiSpec) -> Result<Self> {
         let com = ComApartment::new()?;
-        let audio_client = activate_default_audio_client()?;
+        let activated = activate_default_audio_client()?;
+        let audio_client = activated.audio_client;
         let render_event = OwnedHandle::create_manual_reset(false)?;
         let format = spec.wave_format();
         let stream_flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
@@ -429,18 +525,20 @@ impl PlaybackThreadContext {
             audio_client,
             render_client,
             render_event,
+            endpoint_id: activated.endpoint_id,
             channels: spec.channels as usize,
             buffer_frames,
         })
     }
 
-    fn run(self, stop_event: Handle, ring: &SharedSampleRing) -> Result<()> {
+    fn run(self, stop_event: Handle, ring: &SharedSampleRing) -> Result<ThreadRunState> {
         let result = playback_loop(
             self.audio_client.as_ptr(),
             self.render_client.as_ptr(),
             self.render_event.raw(),
             stop_event,
             ring,
+            &self.endpoint_id,
             self.channels,
             self.buffer_frames,
         );
@@ -458,31 +556,36 @@ fn capture_loop(
     capture_event: Handle,
     stop_event: Handle,
     ring: &SharedSampleRing,
+    endpoint_id: &str,
     channels: usize,
-) -> Result<()> {
+) -> Result<ThreadRunState> {
     let handles = [stop_event, capture_event];
     loop {
-        match wait_for_multiple_objects(&handles)? {
-            0 => return Ok(()),
-            1 => {}
+        match wait_for_multiple_objects_timeout(&handles, DEVICE_REBIND_POLL_MS)? {
+            Some(0) => return Ok(ThreadRunState::Stop),
+            Some(1) => {}
+            None => {
+                if has_default_render_endpoint_changed(endpoint_id)? {
+                    return Ok(ThreadRunState::Restart);
+                }
+                continue;
+            }
             index => {
                 return Err(Error::Backend(format!(
-                    "unexpected wait result from loopback capture thread: {index}"
+                    "unexpected wait result from loopback capture thread: {index:?}"
                 )))
             }
         }
 
         loop {
             let mut packet_frames = 0u32;
-            unsafe {
-                check_hresult(
-                    ((*(*capture_client).lp_vtbl).get_next_packet_size)(
-                        capture_client,
-                        &mut packet_frames,
-                    ),
-                    "IAudioCaptureClient::GetNextPacketSize",
-                )?;
+            let hr = unsafe {
+                ((*(*capture_client).lp_vtbl).get_next_packet_size)(capture_client, &mut packet_frames)
+            };
+            if should_restart_audio_client(hr) {
+                return Ok(ThreadRunState::Restart);
             }
+            check_hresult(hr, "IAudioCaptureClient::GetNextPacketSize")?;
             if packet_frames == 0 {
                 break;
             }
@@ -490,19 +593,20 @@ fn capture_loop(
             let mut data_ptr = ptr::null_mut();
             let mut frames_available = packet_frames;
             let mut flags = 0u32;
-            unsafe {
-                check_hresult(
-                    ((*(*capture_client).lp_vtbl).get_buffer)(
-                        capture_client,
-                        &mut data_ptr,
-                        &mut frames_available,
-                        &mut flags,
-                        ptr::null_mut(),
-                        ptr::null_mut(),
-                    ),
-                    "IAudioCaptureClient::GetBuffer",
-                )?;
+            let hr = unsafe {
+                ((*(*capture_client).lp_vtbl).get_buffer)(
+                    capture_client,
+                    &mut data_ptr,
+                    &mut frames_available,
+                    &mut flags,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            };
+            if should_restart_audio_client(hr) {
+                return Ok(ThreadRunState::Restart);
             }
+            check_hresult(hr, "IAudioCaptureClient::GetBuffer")?;
 
             let sample_count = frames_available as usize * channels;
             if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 {
@@ -512,15 +616,13 @@ fn capture_loop(
                 ring.write_overwrite(samples);
             }
 
-            unsafe {
-                check_hresult(
-                    ((*(*capture_client).lp_vtbl).release_buffer)(
-                        capture_client,
-                        frames_available,
-                    ),
-                    "IAudioCaptureClient::ReleaseBuffer",
-                )?;
+            let hr = unsafe {
+                ((*(*capture_client).lp_vtbl).release_buffer)(capture_client, frames_available)
+            };
+            if should_restart_audio_client(hr) {
+                return Ok(ThreadRunState::Restart);
             }
+            check_hresult(hr, "IAudioCaptureClient::ReleaseBuffer")?;
         }
     }
 }
@@ -564,44 +666,47 @@ fn playback_loop(
     render_event: Handle,
     stop_event: Handle,
     ring: &SharedSampleRing,
+    endpoint_id: &str,
     channels: usize,
     buffer_frames: u32,
-) -> Result<()> {
+) -> Result<ThreadRunState> {
     let handles = [stop_event, render_event];
     loop {
-        match wait_for_multiple_objects(&handles)? {
-            0 => return Ok(()),
-            1 => {}
+        match wait_for_multiple_objects_timeout(&handles, DEVICE_REBIND_POLL_MS)? {
+            Some(0) => return Ok(ThreadRunState::Stop),
+            Some(1) => {}
+            None => {
+                if has_default_render_endpoint_changed(endpoint_id)? {
+                    return Ok(ThreadRunState::Restart);
+                }
+                continue;
+            }
             index => {
                 return Err(Error::Backend(format!(
-                    "unexpected wait result from render thread: {index}"
+                    "unexpected wait result from render thread: {index:?}"
                 )))
             }
         }
 
         let mut padding = 0u32;
-        unsafe {
-            check_hresult(
-                ((*(*audio_client).lp_vtbl).get_current_padding)(audio_client, &mut padding),
-                "IAudioClient::GetCurrentPadding",
-            )?;
+        let hr = unsafe { ((*(*audio_client).lp_vtbl).get_current_padding)(audio_client, &mut padding) };
+        if should_restart_audio_client(hr) {
+            return Ok(ThreadRunState::Restart);
         }
+        check_hresult(hr, "IAudioClient::GetCurrentPadding")?;
         let frames_available = buffer_frames.saturating_sub(padding);
         if frames_available == 0 {
             continue;
         }
 
         let mut data_ptr = ptr::null_mut();
-        unsafe {
-            check_hresult(
-                ((*(*render_client).lp_vtbl).get_buffer)(
-                    render_client,
-                    frames_available,
-                    &mut data_ptr,
-                ),
-                "IAudioRenderClient::GetBuffer",
-            )?;
+        let hr = unsafe {
+            ((*(*render_client).lp_vtbl).get_buffer)(render_client, frames_available, &mut data_ptr)
+        };
+        if should_restart_audio_client(hr) {
+            return Ok(ThreadRunState::Restart);
         }
+        check_hresult(hr, "IAudioRenderClient::GetBuffer")?;
 
         if !data_ptr.is_null() {
             let sample_count = frames_available as usize * channels;
@@ -609,12 +714,13 @@ fn playback_loop(
             ring.read_partial_zero_fill(out);
         }
 
-        unsafe {
-            check_hresult(
-                ((*(*render_client).lp_vtbl).release_buffer)(render_client, frames_available, 0),
-                "IAudioRenderClient::ReleaseBuffer",
-            )?;
+        let hr = unsafe {
+            ((*(*render_client).lp_vtbl).release_buffer)(render_client, frames_available, 0)
+        };
+        if should_restart_audio_client(hr) {
+            return Ok(ThreadRunState::Restart);
         }
+        check_hresult(hr, "IAudioRenderClient::ReleaseBuffer")?;
     }
 }
 
@@ -842,7 +948,41 @@ fn discard_oldest(state: &mut RingState, count: usize) {
     state.len -= count;
 }
 
-fn activate_default_audio_client() -> Result<ComPtr<IAudioClient>> {
+struct ActivatedAudioClient {
+    audio_client: ComPtr<IAudioClient>,
+    endpoint_id: String,
+}
+
+fn activate_default_audio_client() -> Result<ActivatedAudioClient> {
+    let endpoint = get_default_render_endpoint()?;
+    let endpoint_id = get_device_id(endpoint.device.as_ptr())?;
+    let device = endpoint.device;
+
+    let mut audio_client = ptr::null_mut();
+    unsafe {
+        check_hresult(
+            ((*(*device.as_ptr()).lp_vtbl).activate)(
+                device.as_ptr(),
+                &IID_IAUDIO_CLIENT,
+                CLSCTX_ALL,
+                ptr::null_mut(),
+                &mut audio_client,
+            ),
+            "IMMDevice::Activate(IAudioClient)",
+        )?;
+    }
+
+    Ok(ActivatedAudioClient {
+        audio_client: ComPtr::from_raw(audio_client.cast())?,
+        endpoint_id,
+    })
+}
+
+struct DefaultRenderEndpoint {
+    device: ComPtr<IMMDevice>,
+}
+
+fn get_default_render_endpoint() -> Result<DefaultRenderEndpoint> {
     let mut enumerator = ptr::null_mut();
     unsafe {
         check_hresult(
@@ -871,22 +1011,55 @@ fn activate_default_audio_client() -> Result<ComPtr<IAudioClient>> {
         )?;
     }
     let device = ComPtr::<IMMDevice>::from_raw(device)?;
+    Ok(DefaultRenderEndpoint { device })
+}
 
-    let mut audio_client = ptr::null_mut();
+fn current_default_render_endpoint_id() -> Result<String> {
+    let endpoint = get_default_render_endpoint()?;
+    get_device_id(endpoint.device.as_ptr())
+}
+
+fn get_device_id(device: *mut IMMDevice) -> Result<String> {
+    let mut wide_ptr = ptr::null_mut();
     unsafe {
         check_hresult(
-            ((*(*device.as_ptr()).lp_vtbl).activate)(
-                device.as_ptr(),
-                &IID_IAUDIO_CLIENT,
-                CLSCTX_ALL,
-                ptr::null_mut(),
-                &mut audio_client,
-            ),
-            "IMMDevice::Activate(IAudioClient)",
+            ((*(*device).lp_vtbl).get_id)(device, &mut wide_ptr),
+            "IMMDevice::GetId",
         )?;
     }
 
-    ComPtr::from_raw(audio_client.cast())
+    if wide_ptr.is_null() {
+        return Err(Error::Backend("IMMDevice::GetId returned null".into()));
+    }
+
+    let id = unsafe {
+        let mut len = 0usize;
+        while *wide_ptr.add(len) != 0 {
+            len += 1;
+        }
+        let slice = slice::from_raw_parts(wide_ptr, len);
+        String::from_utf16_lossy(slice)
+    };
+
+    unsafe { CoTaskMemFree(wide_ptr.cast()) };
+    Ok(id)
+}
+
+fn has_default_render_endpoint_changed(bound_endpoint_id: &str) -> Result<bool> {
+    match current_default_render_endpoint_id() {
+        Ok(current) => Ok(current != bound_endpoint_id),
+        Err(_) => Ok(true),
+    }
+}
+
+fn should_restart_audio_client(hr: i32) -> bool {
+    matches!(
+        hr,
+        AUDCLNT_E_DEVICE_INVALIDATED
+            | AUDCLNT_E_ENDPOINT_CREATE_FAILED
+            | AUDCLNT_E_SERVICE_NOT_RUNNING
+            | AUDCLNT_E_RESOURCES_INVALIDATED
+    )
 }
 
 fn get_service<T>(
@@ -904,10 +1077,13 @@ fn get_service<T>(
     ComPtr::from_raw(service.cast())
 }
 
-fn wait_for_multiple_objects(handles: &[Handle]) -> Result<usize> {
+fn wait_for_multiple_objects_timeout(handles: &[Handle], timeout_ms: u32) -> Result<Option<usize>> {
     let result = unsafe {
-        WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), FALSE, INFINITE)
+        WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), FALSE, timeout_ms)
     };
+    if result == WAIT_TIMEOUT {
+        return Ok(None);
+    }
     if result == WAIT_FAILED {
         return Err(last_os_error("WaitForMultipleObjects"));
     }
@@ -916,7 +1092,11 @@ fn wait_for_multiple_objects(handles: &[Handle]) -> Result<usize> {
             "WaitForMultipleObjects returned unexpected value 0x{result:08X}"
         )));
     }
-    Ok((result - WAIT_OBJECT_0) as usize)
+    Ok(Some((result - WAIT_OBJECT_0) as usize))
+}
+
+fn wait_for_stop_or_timeout(stop_event: Handle, timeout_ms: u32) -> Result<bool> {
+    Ok(wait_for_multiple_objects_timeout(&[stop_event], timeout_ms)?.is_some())
 }
 
 fn check_hresult(hr: i32, action: &str) -> Result<()> {
@@ -1239,6 +1419,7 @@ unsafe extern "system" {
 unsafe extern "system" {
     fn CoInitializeEx(reserved: *mut c_void, coinit: u32) -> i32;
     fn CoUninitialize();
+    fn CoTaskMemFree(memory: *mut c_void);
     fn CoCreateInstance(
         clsid: *const Guid,
         outer: *mut c_void,
