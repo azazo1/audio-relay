@@ -5,7 +5,9 @@ use crate::playback::AudioOutput;
 
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod unsupported;
 
 pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<dyn AudioInput>> {
@@ -13,7 +15,11 @@ pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<d
     {
         return macos::open_input(config, stream);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        return windows::open_input(config, stream);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         return unsupported::open_input(config, stream);
     }
@@ -24,7 +30,11 @@ pub fn open_output(config: &PlaybackConfig, stream: &StreamParams) -> Result<Box
     {
         return macos::open_output(config, stream);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        return windows::open_output(config, stream);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         return unsupported::open_output(config, stream);
     }
