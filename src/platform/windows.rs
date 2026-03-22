@@ -204,11 +204,18 @@ fn spawn_capture_thread(
     let thread = thread::Builder::new()
         .name("audio-relay-win-capture".into())
         .spawn(move || {
-            let result = run_capture_thread(stop_event, Arc::clone(&ring), spec);
-            let startup = result.as_ref().map(|_| ()).map_err(|err| err.to_string());
-            let _ = ready_tx.send(startup);
-            if let Err(err) = result {
-                ring.close(Some(err.to_string()));
+            match CaptureThreadContext::start(spec) {
+                Ok(context) => {
+                    let _ = ready_tx.send(Ok(()));
+                    if let Err(err) = context.run(stop_event, &ring) {
+                        ring.close(Some(err.to_string()));
+                    }
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    let _ = ready_tx.send(Err(message.clone()));
+                    ring.close(Some(message));
+                }
             }
         })
         .map_err(|err| Error::Backend(format!("failed to spawn Windows capture thread: {err}")))?;
@@ -237,11 +244,18 @@ fn spawn_playback_thread(
     let thread = thread::Builder::new()
         .name("audio-relay-win-playback".into())
         .spawn(move || {
-            let result = run_playback_thread(stop_event, Arc::clone(&ring), spec);
-            let startup = result.as_ref().map(|_| ()).map_err(|err| err.to_string());
-            let _ = ready_tx.send(startup);
-            if let Err(err) = result {
-                ring.close(Some(err.to_string()));
+            match PlaybackThreadContext::start(spec) {
+                Ok(context) => {
+                    let _ = ready_tx.send(Ok(()));
+                    if let Err(err) = context.run(stop_event, &ring) {
+                        ring.close(Some(err.to_string()));
+                    }
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    let _ = ready_tx.send(Err(message.clone()));
+                    ring.close(Some(message));
+                }
             }
         })
         .map_err(|err| Error::Backend(format!("failed to spawn Windows playback thread: {err}")))?;
@@ -261,65 +275,182 @@ fn spawn_playback_thread(
     }
 }
 
-fn run_capture_thread(stop_event: Handle, ring: Arc<SharedSampleRing>, spec: WasapiSpec) -> Result<()> {
-    let _com = ComApartment::new()?;
-    let audio_client = activate_default_audio_client()?;
-    let capture_event = OwnedHandle::create_manual_reset(false)?;
-    let format = spec.wave_format();
-    let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK
-        | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-        | AUDCLNT_STREAMFLAGS_NOPERSIST
-        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+struct CaptureThreadContext {
+    _com: ComApartment,
+    audio_client: ComPtr<IAudioClient>,
+    capture_client: ComPtr<IAudioCaptureClient>,
+    capture_event: OwnedHandle,
+    channels: usize,
+}
 
-    unsafe {
-        check_hresult(
-            ((*(*audio_client.as_ptr()).lp_vtbl).initialize)(
-                audio_client.as_ptr(),
-                AUDCLNT_SHAREMODE_SHARED,
-                stream_flags,
-                SHARED_BUFFER_DURATION_HNS,
-                0,
-                &format,
-                ptr::null(),
-            ),
-            "IAudioClient::Initialize(loopback)",
+impl CaptureThreadContext {
+    fn start(spec: WasapiSpec) -> Result<Self> {
+        let com = ComApartment::new()?;
+        let audio_client = activate_default_audio_client()?;
+        let capture_event = OwnedHandle::create_manual_reset(false)?;
+        let format = spec.wave_format();
+        let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK
+            | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+            | AUDCLNT_STREAMFLAGS_NOPERSIST
+            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+
+        unsafe {
+            check_hresult(
+                ((*(*audio_client.as_ptr()).lp_vtbl).initialize)(
+                    audio_client.as_ptr(),
+                    AUDCLNT_SHAREMODE_SHARED,
+                    stream_flags,
+                    SHARED_BUFFER_DURATION_HNS,
+                    0,
+                    &format,
+                    ptr::null(),
+                ),
+                "IAudioClient::Initialize(loopback)",
+            )?;
+            check_hresult(
+                ((*(*audio_client.as_ptr()).lp_vtbl).set_event_handle)(
+                    audio_client.as_ptr(),
+                    capture_event.raw(),
+                ),
+                "IAudioClient::SetEventHandle(loopback)",
+            )?;
+        }
+
+        let capture_client = get_service::<IAudioCaptureClient>(
+            audio_client.as_ptr(),
+            &IID_IAUDIO_CAPTURE_CLIENT,
+            "IAudioClient::GetService(IAudioCaptureClient)",
         )?;
-        check_hresult(
-            ((*(*audio_client.as_ptr()).lp_vtbl).set_event_handle)(
-                audio_client.as_ptr(),
-                capture_event.raw(),
-            ),
-            "IAudioClient::SetEventHandle(loopback)",
-        )?;
+
+        unsafe {
+            check_hresult(
+                ((*(*audio_client.as_ptr()).lp_vtbl).start)(audio_client.as_ptr()),
+                "IAudioClient::Start(loopback)",
+            )?;
+        }
+
+        Ok(Self {
+            _com: com,
+            audio_client,
+            capture_client,
+            capture_event,
+            channels: spec.channels as usize,
+        })
     }
 
-    let capture_client = get_service::<IAudioCaptureClient>(
-        audio_client.as_ptr(),
-        &IID_IAUDIO_CAPTURE_CLIENT,
-        "IAudioClient::GetService(IAudioCaptureClient)",
-    )?;
+    fn run(self, stop_event: Handle, ring: &SharedSampleRing) -> Result<()> {
+        let result = capture_loop(
+            self.capture_client.as_ptr(),
+            self.capture_event.raw(),
+            stop_event,
+            ring,
+            self.channels,
+        );
 
-    unsafe {
-        check_hresult(
-            ((*(*audio_client.as_ptr()).lp_vtbl).start)(audio_client.as_ptr()),
-            "IAudioClient::Start(loopback)",
+        unsafe {
+            let _ = ((*(*self.audio_client.as_ptr()).lp_vtbl).stop)(self.audio_client.as_ptr());
+        }
+
+        result
+    }
+}
+
+struct PlaybackThreadContext {
+    _com: ComApartment,
+    audio_client: ComPtr<IAudioClient>,
+    render_client: ComPtr<IAudioRenderClient>,
+    render_event: OwnedHandle,
+    channels: usize,
+    buffer_frames: u32,
+}
+
+impl PlaybackThreadContext {
+    fn start(spec: WasapiSpec) -> Result<Self> {
+        let com = ComApartment::new()?;
+        let audio_client = activate_default_audio_client()?;
+        let render_event = OwnedHandle::create_manual_reset(false)?;
+        let format = spec.wave_format();
+        let stream_flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+            | AUDCLNT_STREAMFLAGS_NOPERSIST
+            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+
+        unsafe {
+            check_hresult(
+                ((*(*audio_client.as_ptr()).lp_vtbl).initialize)(
+                    audio_client.as_ptr(),
+                    AUDCLNT_SHAREMODE_SHARED,
+                    stream_flags,
+                    SHARED_BUFFER_DURATION_HNS,
+                    0,
+                    &format,
+                    ptr::null(),
+                ),
+                "IAudioClient::Initialize(render)",
+            )?;
+            check_hresult(
+                ((*(*audio_client.as_ptr()).lp_vtbl).set_event_handle)(
+                    audio_client.as_ptr(),
+                    render_event.raw(),
+                ),
+                "IAudioClient::SetEventHandle(render)",
+            )?;
+        }
+
+        let mut buffer_frames = 0u32;
+        unsafe {
+            check_hresult(
+                ((*(*audio_client.as_ptr()).lp_vtbl).get_buffer_size)(
+                    audio_client.as_ptr(),
+                    &mut buffer_frames,
+                ),
+                "IAudioClient::GetBufferSize",
+            )?;
+        }
+
+        let render_client = get_service::<IAudioRenderClient>(
+            audio_client.as_ptr(),
+            &IID_IAUDIO_RENDER_CLIENT,
+            "IAudioClient::GetService(IAudioRenderClient)",
         )?;
+
+        prime_render_buffer(render_client.as_ptr(), buffer_frames, spec.channels as usize)?;
+
+        unsafe {
+            check_hresult(
+                ((*(*audio_client.as_ptr()).lp_vtbl).start)(audio_client.as_ptr()),
+                "IAudioClient::Start(render)",
+            )?;
+        }
+
+        Ok(Self {
+            _com: com,
+            audio_client,
+            render_client,
+            render_event,
+            channels: spec.channels as usize,
+            buffer_frames,
+        })
     }
 
-    let result = capture_loop(
-        capture_client.as_ptr(),
-        capture_event.raw(),
-        stop_event,
-        &ring,
-        spec.channels as usize,
-    );
+    fn run(self, stop_event: Handle, ring: &SharedSampleRing) -> Result<()> {
+        let result = playback_loop(
+            self.audio_client.as_ptr(),
+            self.render_client.as_ptr(),
+            self.render_event.raw(),
+            stop_event,
+            ring,
+            self.channels,
+            self.buffer_frames,
+        );
 
-    unsafe {
-        let _ = ((*(*audio_client.as_ptr()).lp_vtbl).stop)(audio_client.as_ptr());
+        unsafe {
+            let _ = ((*(*self.audio_client.as_ptr()).lp_vtbl).stop)(self.audio_client.as_ptr());
+        }
+
+        result
     }
-
-    result
 }
 
 fn capture_loop(
@@ -392,85 +523,6 @@ fn capture_loop(
             }
         }
     }
-}
-
-fn run_playback_thread(
-    stop_event: Handle,
-    ring: Arc<SharedSampleRing>,
-    spec: WasapiSpec,
-) -> Result<()> {
-    let _com = ComApartment::new()?;
-    let audio_client = activate_default_audio_client()?;
-    let render_event = OwnedHandle::create_manual_reset(false)?;
-    let format = spec.wave_format();
-    let stream_flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-        | AUDCLNT_STREAMFLAGS_NOPERSIST
-        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-
-    unsafe {
-        check_hresult(
-            ((*(*audio_client.as_ptr()).lp_vtbl).initialize)(
-                audio_client.as_ptr(),
-                AUDCLNT_SHAREMODE_SHARED,
-                stream_flags,
-                SHARED_BUFFER_DURATION_HNS,
-                0,
-                &format,
-                ptr::null(),
-            ),
-            "IAudioClient::Initialize(render)",
-        )?;
-        check_hresult(
-            ((*(*audio_client.as_ptr()).lp_vtbl).set_event_handle)(
-                audio_client.as_ptr(),
-                render_event.raw(),
-            ),
-            "IAudioClient::SetEventHandle(render)",
-        )?;
-    }
-
-    let mut buffer_frames = 0u32;
-    unsafe {
-        check_hresult(
-            ((*(*audio_client.as_ptr()).lp_vtbl).get_buffer_size)(
-                audio_client.as_ptr(),
-                &mut buffer_frames,
-            ),
-            "IAudioClient::GetBufferSize",
-        )?;
-    }
-
-    let render_client = get_service::<IAudioRenderClient>(
-        audio_client.as_ptr(),
-        &IID_IAUDIO_RENDER_CLIENT,
-        "IAudioClient::GetService(IAudioRenderClient)",
-    )?;
-
-    prime_render_buffer(render_client.as_ptr(), buffer_frames, spec.channels as usize)?;
-
-    unsafe {
-        check_hresult(
-            ((*(*audio_client.as_ptr()).lp_vtbl).start)(audio_client.as_ptr()),
-            "IAudioClient::Start(render)",
-        )?;
-    }
-
-    let result = playback_loop(
-        audio_client.as_ptr(),
-        render_client.as_ptr(),
-        render_event.raw(),
-        stop_event,
-        &ring,
-        spec.channels as usize,
-        buffer_frames,
-    );
-
-    unsafe {
-        let _ = ((*(*audio_client.as_ptr()).lp_vtbl).stop)(audio_client.as_ptr());
-    }
-
-    result
 }
 
 fn prime_render_buffer(
