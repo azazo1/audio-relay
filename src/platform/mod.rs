@@ -5,10 +5,10 @@ use crate::playback::AudioOutput;
 
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(target_os = "windows")]
-mod windows;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod unsupported;
+#[cfg(target_os = "windows")]
+mod windows;
 
 pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<dyn AudioInput>> {
     #[cfg(target_os = "macos")]

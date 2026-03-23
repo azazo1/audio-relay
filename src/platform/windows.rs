@@ -73,14 +73,22 @@ const IID_IAUDIO_CAPTURE_CLIENT: Guid = Guid::new(
 );
 
 pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<dyn AudioInput>> {
-    validate_stream("Windows WASAPI loopback capture", config.device_name.as_deref(), stream)?;
+    validate_stream(
+        "Windows WASAPI loopback capture",
+        config.device_name.as_deref(),
+        stream,
+    )?;
 
     let ring = Arc::new(SharedSampleRing::new(
         stream.sample_rate as usize * stream.channels as usize * CAPTURE_RING_SECONDS,
         "windows capture backend has been closed",
     ));
     let stop_event = OwnedHandle::create_manual_reset(false)?;
-    let thread = spawn_capture_thread(stop_event.raw(), Arc::clone(&ring), WasapiSpec::from_stream(stream))?;
+    let thread = spawn_capture_thread(
+        stop_event.raw(),
+        Arc::clone(&ring),
+        WasapiSpec::from_stream(stream),
+    )?;
 
     Ok(Box::new(WindowsInput {
         ring,
@@ -89,18 +97,23 @@ pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<d
     }))
 }
 
-pub fn open_output(
-    config: &PlaybackConfig,
-    stream: &StreamParams,
-) -> Result<Box<dyn AudioOutput>> {
-    validate_stream("Windows WASAPI playback", config.device_name.as_deref(), stream)?;
+pub fn open_output(config: &PlaybackConfig, stream: &StreamParams) -> Result<Box<dyn AudioOutput>> {
+    validate_stream(
+        "Windows WASAPI playback",
+        config.device_name.as_deref(),
+        stream,
+    )?;
 
     let ring = Arc::new(SharedSampleRing::new(
         stream.sample_rate as usize * stream.channels as usize * PLAYBACK_RING_SECONDS,
         "windows playback backend has been closed",
     ));
     let stop_event = OwnedHandle::create_manual_reset(false)?;
-    let thread = spawn_playback_thread(stop_event.raw(), Arc::clone(&ring), WasapiSpec::from_stream(stream))?;
+    let thread = spawn_playback_thread(
+        stop_event.raw(),
+        Arc::clone(&ring),
+        WasapiSpec::from_stream(stream),
+    )?;
 
     Ok(Box::new(WindowsOutput {
         ring,
@@ -511,7 +524,11 @@ impl PlaybackThreadContext {
             "IAudioClient::GetService(IAudioRenderClient)",
         )?;
 
-        prime_render_buffer(render_client.as_ptr(), buffer_frames, spec.channels as usize)?;
+        prime_render_buffer(
+            render_client.as_ptr(),
+            buffer_frames,
+            spec.channels as usize,
+        )?;
 
         unsafe {
             check_hresult(
@@ -574,14 +591,17 @@ fn capture_loop(
             index => {
                 return Err(Error::Backend(format!(
                     "unexpected wait result from loopback capture thread: {index:?}"
-                )))
+                )));
             }
         }
 
         loop {
             let mut packet_frames = 0u32;
             let hr = unsafe {
-                ((*(*capture_client).lp_vtbl).get_next_packet_size)(capture_client, &mut packet_frames)
+                ((*(*capture_client).lp_vtbl).get_next_packet_size)(
+                    capture_client,
+                    &mut packet_frames,
+                )
             };
             if should_restart_audio_client(hr) {
                 return Ok(ThreadRunState::Restart);
@@ -613,7 +633,8 @@ fn capture_loop(
             if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 {
                 ring.write_silence_overwrite(sample_count);
             } else if !data_ptr.is_null() && sample_count > 0 {
-                let samples = unsafe { slice::from_raw_parts(data_ptr as *const f32, sample_count) };
+                let samples =
+                    unsafe { slice::from_raw_parts(data_ptr as *const f32, sample_count) };
                 ring.write_overwrite(samples);
             }
 
@@ -686,12 +707,13 @@ fn playback_loop(
             index => {
                 return Err(Error::Backend(format!(
                     "unexpected wait result from render thread: {index:?}"
-                )))
+                )));
             }
         }
 
         let mut padding = 0u32;
-        let hr = unsafe { ((*(*audio_client).lp_vtbl).get_current_padding)(audio_client, &mut padding) };
+        let hr =
+            unsafe { ((*(*audio_client).lp_vtbl).get_current_padding)(audio_client, &mut padding) };
         if should_restart_audio_client(hr) {
             return Ok(ThreadRunState::Restart);
         }
@@ -1077,11 +1099,7 @@ fn should_restart_audio_client(hr: i32) -> bool {
     )
 }
 
-fn get_service<T>(
-    audio_client: *mut IAudioClient,
-    iid: &Guid,
-    action: &str,
-) -> Result<ComPtr<T>> {
+fn get_service<T>(audio_client: *mut IAudioClient, iid: &Guid, action: &str) -> Result<ComPtr<T>> {
     let mut service = ptr::null_mut();
     unsafe {
         check_hresult(
@@ -1130,7 +1148,10 @@ fn format_hresult(hr: i32) -> String {
 }
 
 fn last_os_error(action: &str) -> Error {
-    Error::Backend(format!("{action} failed: {}", std::io::Error::last_os_error()))
+    Error::Backend(format!(
+        "{action} failed: {}",
+        std::io::Error::last_os_error()
+    ))
 }
 
 struct ComApartment;
@@ -1185,8 +1206,7 @@ struct OwnedHandle(Handle);
 
 impl OwnedHandle {
     fn create_manual_reset(initial_state: bool) -> Result<Self> {
-        let handle =
-            unsafe { CreateEventW(ptr::null_mut(), 1, initial_state as i32, ptr::null()) };
+        let handle = unsafe { CreateEventW(ptr::null_mut(), 1, initial_state as i32, ptr::null()) };
         if handle.is_null() {
             Err(last_os_error("CreateEventW"))
         } else {
@@ -1283,8 +1303,7 @@ struct IUnknown {
 
 #[repr(C)]
 struct IUnknownVtbl {
-    query_interface:
-        unsafe extern "system" fn(*mut IUnknown, *const Guid, *mut *mut c_void) -> i32,
+    query_interface: unsafe extern "system" fn(*mut IUnknown, *const Guid, *mut *mut c_void) -> i32,
     add_ref: unsafe extern "system" fn(*mut IUnknown) -> u32,
     release: unsafe extern "system" fn(*mut IUnknown) -> u32,
 }
@@ -1330,8 +1349,7 @@ struct IMMDeviceVtbl {
         *mut PropVariant,
         *mut *mut c_void,
     ) -> i32,
-    open_property_store:
-        unsafe extern "system" fn(*mut IMMDevice, u32, *mut *mut c_void) -> i32,
+    open_property_store: unsafe extern "system" fn(*mut IMMDevice, u32, *mut *mut c_void) -> i32,
     get_id: unsafe extern "system" fn(*mut IMMDevice, *mut *mut u16) -> i32,
     get_state: unsafe extern "system" fn(*mut IMMDevice, *mut u32) -> i32,
 }
